@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <gtest/gtest-spi.h>
 
+#include "consensus/upgrades.h"
 #include "consensus/validation.h"
 #include "core_io.h"
 #include "main.h"
@@ -8,6 +9,9 @@
 #include "txmempool.h"
 #include "policy/fees.h"
 #include "util.h"
+
+// Implementaion is in test_checktransaction.cpp
+extern CMutableTransaction GetValidTransaction();
 
 // Fake the input of transaction 5295156213414ed77f6e538e7e8ebe14492156906b9fe995b242477818789364
 // - 532639cc6bebed47c1c69ae36dd498c68a012e74ad12729adbd3dbb56f8f3f4a, 0
@@ -92,6 +96,8 @@ TEST(Mempool, PriorityStatsDoNotCrash) {
 }
 
 TEST(Mempool, TxInputLimit) {
+    SelectParams(CBaseChainParams::TESTNET);
+
     CTxMemPool pool(::minRelayTxFee);
     bool missingInputs;
 
@@ -136,3 +142,93 @@ TEST(Mempool, TxInputLimit) {
     EXPECT_EQ(state4.GetRejectReason(), "bad-txns-version-too-low");
 }
 
+// Valid overwinter v3 format tx gets rejected because overwinter hasn't activated yet.
+TEST(Mempool, OverwinterNotActiveYet) {
+    SelectParams(CBaseChainParams::REGTEST);
+    UpdateNetworkUpgradeParameters(Consensus::UPGRADE_OVERWINTER, Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT);
+
+    CTxMemPool pool(::minRelayTxFee);
+    bool missingInputs;
+    CMutableTransaction mtx = GetValidTransaction();
+    mtx.vjoinsplit.resize(0); // no joinsplits
+    mtx.fOverwintered = true;
+    mtx.nVersion = 3;
+    mtx.nVersionGroupId = OVERWINTER_VERSION_GROUP_ID;
+    mtx.nExpiryHeight = 0;
+    CValidationState state1;
+
+    CTransaction tx1(mtx);
+    EXPECT_FALSE(AcceptToMemoryPool(pool, state1, tx1, false, &missingInputs));
+    EXPECT_EQ(state1.GetRejectReason(), "tx-overwinter-not-active");
+
+    // Revert to default
+    UpdateNetworkUpgradeParameters(Consensus::UPGRADE_OVERWINTER, Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT);
+}
+
+
+// Sprout transaction version 3 when Overwinter is not active:
+// 1. pass CheckTransaction (and CheckTransactionWithoutProofVerification)
+// 2. pass ContextualCheckTransaction
+// 3. fail IsStandardTx
+TEST(Mempool, SproutV3TxFailsAsExpected) {
+    SelectParams(CBaseChainParams::TESTNET);
+
+    CTxMemPool pool(::minRelayTxFee);
+    bool missingInputs;
+    CMutableTransaction mtx = GetValidTransaction();
+    mtx.vjoinsplit.resize(0); // no joinsplits
+    mtx.fOverwintered = false;
+    mtx.nVersion = 3;
+    CValidationState state1;
+    CTransaction tx1(mtx);
+
+    EXPECT_FALSE(AcceptToMemoryPool(pool, state1, tx1, false, &missingInputs));
+    EXPECT_EQ(state1.GetRejectReason(), "version");
+}
+
+
+// Sprout transaction version 3 when Overwinter is always active:
+// 1. pass CheckTransaction (and CheckTransactionWithoutProofVerification)
+// 2. fails ContextualCheckTransaction
+TEST(Mempool, SproutV3TxWhenOverwinterActive) {
+    SelectParams(CBaseChainParams::REGTEST);
+    UpdateNetworkUpgradeParameters(Consensus::UPGRADE_OVERWINTER, Consensus::NetworkUpgrade::ALWAYS_ACTIVE);
+
+    CTxMemPool pool(::minRelayTxFee);
+    bool missingInputs;
+    CMutableTransaction mtx = GetValidTransaction();
+    mtx.vjoinsplit.resize(0); // no joinsplits
+    mtx.fOverwintered = false;
+    mtx.nVersion = 3;
+    CValidationState state1;
+    CTransaction tx1(mtx);
+
+    EXPECT_FALSE(AcceptToMemoryPool(pool, state1, tx1, false, &missingInputs));
+    EXPECT_EQ(state1.GetRejectReason(), "tx-overwinter-flag-not-set");
+
+    // Revert to default
+    UpdateNetworkUpgradeParameters(Consensus::UPGRADE_OVERWINTER, Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT);
+}
+
+
+// Sprout transaction version -3 when Overwinter is always active:
+// 1. fails CheckTransaction (specifically CheckTransactionWithoutProofVerification)
+TEST(Mempool, SproutNegativeVersionTxWhenOverwinterActive) {
+    SelectParams(CBaseChainParams::REGTEST);
+    UpdateNetworkUpgradeParameters(Consensus::UPGRADE_OVERWINTER, Consensus::NetworkUpgrade::ALWAYS_ACTIVE);
+
+    CTxMemPool pool(::minRelayTxFee);
+    bool missingInputs;
+    CMutableTransaction mtx = GetValidTransaction();
+    mtx.vjoinsplit.resize(0); // no joinsplits
+    mtx.fOverwintered = false;
+    mtx.nVersion = -3;
+    CValidationState state1;
+    CTransaction tx1(mtx);
+
+    EXPECT_FALSE(AcceptToMemoryPool(pool, state1, tx1, false, &missingInputs));
+    EXPECT_EQ(state1.GetRejectReason(), "bad-txns-version-too-low");
+
+    // Revert to default
+    UpdateNetworkUpgradeParameters(Consensus::UPGRADE_OVERWINTER, Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT);
+}

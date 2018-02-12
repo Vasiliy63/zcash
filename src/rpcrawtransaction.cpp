@@ -489,6 +489,7 @@ UniValue decoderawtransaction(const UniValue& params, bool fHelp)
             "{\n"
             "  \"txid\" : \"id\",        (string) The transaction id\n"
             "  \"version\" : n,          (numeric) The version\n"
+            // FIXME: we need to return overwinter flag and version group id 
             "  \"locktime\" : ttt,       (numeric) The lock time\n"
             "  \"vin\" : [               (array of json objects)\n"
             "     {\n"

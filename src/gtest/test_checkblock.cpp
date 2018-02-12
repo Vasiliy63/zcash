@@ -33,6 +33,38 @@ TEST(CheckBlock, VersionTooLow) {
     EXPECT_FALSE(CheckBlock(block, state, verifier, false, false));
 }
 
+
+// Test that a sprout tx with negative version is still rejected
+// by CheckBlock under sprout consensus rules.
+TEST(CheckBlock, BlockSproutRejectsBadVersion) {
+    SelectParams(CBaseChainParams::MAIN);
+
+    CMutableTransaction mtx;
+    mtx.vin.resize(1);
+    mtx.vin[0].prevout.SetNull();
+    mtx.vin[0].scriptSig = CScript() << 1 << OP_0;
+    mtx.vout.resize(1);
+    mtx.vout[0].scriptPubKey = CScript() << OP_TRUE;
+    mtx.vout[0].nValue = 0;
+    mtx.vout.push_back(CTxOut(GetBlockSubsidy(1, Params().GetConsensus())/5, Params().GetFoundersRewardScriptAtHeight(1)));
+    mtx.fOverwintered = false;
+    mtx.nVersion = -1;
+    mtx.nVersionGroupId = 0;
+
+    CTransaction tx {mtx};
+    CBlock block;
+    block.vtx.push_back(tx);
+
+    MockCValidationState state;
+    CBlockIndex indexPrev {block};
+
+    auto verifier = libzcash::ProofVerifier::Strict();
+
+    EXPECT_CALL(state, DoS(100, false, REJECT_INVALID, "bad-txns-version-too-low", false)).Times(1);
+    EXPECT_FALSE(CheckBlock(block, state, verifier, false, false));
+}
+
+
 TEST(ContextualCheckBlock, BadCoinbaseHeight) {
     SelectParams(CBaseChainParams::MAIN);
 
@@ -74,4 +106,92 @@ TEST(ContextualCheckBlock, BadCoinbaseHeight) {
     CTransaction tx4 {mtx};
     block.vtx[0] = tx4;
     EXPECT_TRUE(ContextualCheckBlock(block, state, &indexPrev));
+}
+
+// That a block evaluated under Sprout rules will reject Overwinter transactions.
+TEST(ContextualCheckBlock, BlockSproutRulesOverwinterTx) {
+    SelectParams(CBaseChainParams::MAIN);
+
+    CMutableTransaction mtx;
+    mtx.vin.resize(1);
+    mtx.vin[0].prevout.SetNull();
+    mtx.vin[0].scriptSig = CScript() << 1 << OP_0;
+    mtx.vout.resize(1);
+    mtx.vout[0].scriptPubKey = CScript() << OP_TRUE;
+    mtx.vout[0].nValue = 0;
+
+    mtx.fOverwintered = true;
+    mtx.nVersion = 3;
+    mtx.nVersionGroupId = OVERWINTER_VERSION_GROUP_ID;
+
+    CTransaction tx {mtx};
+    CBlock block;
+    block.vtx.push_back(tx);
+
+    MockCValidationState state;
+    CBlockIndex indexPrev {block};
+
+    EXPECT_CALL(state, DoS(100, false, REJECT_INVALID, "tx-overwinter-not-active", false)).Times(1);
+    EXPECT_FALSE(ContextualCheckBlock(block, state, &indexPrev));
+}
+
+
+// Test block evaluated under Overwinter rules will accept Overwinter transactions
+TEST(ContextualCheckBlock, BlockOverwinterRulesAcceptOverwinterTx) {
+    SelectParams(CBaseChainParams::REGTEST);
+    UpdateNetworkUpgradeParameters(Consensus::UPGRADE_OVERWINTER, Consensus::NetworkUpgrade::ALWAYS_ACTIVE);
+
+    CMutableTransaction mtx;
+    mtx.vin.resize(1);
+    mtx.vin[0].prevout.SetNull();
+    mtx.vin[0].scriptSig = CScript() << 1 << OP_0;
+    mtx.vout.resize(1);
+    mtx.vout[0].scriptPubKey = CScript() << OP_TRUE;
+    mtx.vout[0].nValue = 0;
+    mtx.vout.push_back(CTxOut(GetBlockSubsidy(1, Params().GetConsensus())/5, Params().GetFoundersRewardScriptAtHeight(1)));
+    mtx.fOverwintered = true;
+    mtx.nVersion = 3;
+    mtx.nVersionGroupId = OVERWINTER_VERSION_GROUP_ID;
+
+    CTransaction tx {mtx};
+    CBlock block;
+    block.vtx.push_back(tx);
+    MockCValidationState state;
+    CBlockIndex indexPrev {block};
+
+    EXPECT_TRUE(ContextualCheckBlock(block, state, &indexPrev));
+
+    // Revert to default
+    UpdateNetworkUpgradeParameters(Consensus::UPGRADE_OVERWINTER, Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT);
+}
+
+
+
+// Test block evaluated under Overwinter rules will reject Sprout transactions
+TEST(ContextualCheckBlock, BlockOverwinterRulesRejectSproutTx) {
+    SelectParams(CBaseChainParams::REGTEST);
+    UpdateNetworkUpgradeParameters(Consensus::UPGRADE_OVERWINTER, Consensus::NetworkUpgrade::ALWAYS_ACTIVE);
+
+    CMutableTransaction mtx;
+    mtx.vin.resize(1);
+    mtx.vin[0].prevout.SetNull();
+    mtx.vin[0].scriptSig = CScript() << 1 << OP_0;
+    mtx.vout.resize(1);
+    mtx.vout[0].scriptPubKey = CScript() << OP_TRUE;
+    mtx.vout[0].nValue = 0;
+
+    mtx.nVersion = 2;
+
+    CTransaction tx {mtx};
+    CBlock block;
+    block.vtx.push_back(tx);
+
+    MockCValidationState state;
+    CBlockIndex indexPrev {block};
+
+    EXPECT_CALL(state, DoS(100, false, REJECT_INVALID, "tx-overwinter-active", false)).Times(1);
+    EXPECT_FALSE(ContextualCheckBlock(block, state, &indexPrev));
+
+    // Revert to default
+    UpdateNetworkUpgradeParameters(Consensus::UPGRADE_OVERWINTER, Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT);
 }
