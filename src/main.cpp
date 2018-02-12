@@ -641,16 +641,22 @@ unsigned int LimitOrphanTxSize(unsigned int nMaxOrphans) EXCLUSIVE_LOCKS_REQUIRE
 }
 
 
-
-
-
-
-
-bool IsStandardTx(const CTransaction& tx, string& reason)
+bool IsStandardTx(const CTransaction& tx, string& reason, const int nHeight)
 {
-    if (tx.nVersion > CTransaction::MAX_CURRENT_VERSION || tx.nVersion < CTransaction::MIN_CURRENT_VERSION) {
-        reason = "version";
-        return false;
+    bool isOverwinter = NetworkUpgradeActive(nHeight, Params().GetConsensus(), Consensus::UPGRADE_OVERWINTER);
+
+    if (isOverwinter) {
+        // Overwinter consensus rules apply
+        if (tx.nVersion > CTransaction::OVERWINTER_MAX_CURRENT_VERSION || tx.nVersion < CTransaction::OVERWINTER_MIN_CURRENT_VERSION) {
+            reason = "invalid-overwinter-version";
+            return false;
+        }
+    } else {
+        // Sprout consensus rules apply
+        if (tx.nVersion > CTransaction::MAX_CURRENT_VERSION || tx.nVersion < CTransaction::MIN_CURRENT_VERSION) {
+            reason = "version";
+            return false;
+        }
     }
 
     BOOST_FOREACH(const CTxIn& txin, tx.vin)
@@ -840,6 +846,53 @@ unsigned int GetP2SHSigOpCount(const CTransaction& tx, const CCoinsViewCache& in
     return nSigOps;
 }
 
+/**
+ * Check a transaction contextually against a set of consensus rules valid at a given block height.
+ * 
+ * Notes:
+ * 1. AcceptToMemoryPool calls this function and CheckTransaction.
+ * 2. ProcessNewBlock calls AcceptBlock which calls CheckBlock (which calls CheckTransaction)
+ *    and ContextualCheckBlock (which calls this function).
+ */
+bool ContextualCheckTransaction(const CTransaction& tx, CValidationState &state, const int nHeight, const int dosLevel)
+{
+    bool isOverwinter = NetworkUpgradeActive(nHeight, Params().GetConsensus(), Consensus::UPGRADE_OVERWINTER);
+    bool isSprout = !isOverwinter;
+
+    // If Sprout rules apply, reject transactions which are intended for Overwinter and beyond
+    if (isSprout && tx.fOverwintered) {
+        return state.DoS(dosLevel, error("ContextualCheckTransaction(): overwinter is not active yet"),
+                         REJECT_INVALID, "tx-overwinter-not-active");
+    }
+
+    // If Overwinter rules apply, reject transactions with valid version but missing overwinter flag
+    if (isOverwinter && tx.nVersion >= CTransaction::OVERWINTER_MIN_CURRENT_VERSION && !tx.fOverwintered) {
+        return state.DoS(dosLevel, error("ContextualCheckTransaction(): overwinter flag must be set"),
+                         REJECT_INVALID, "tx-overwinter-flag-not-set");
+    }
+
+    // If Overwinter rules apply, reject transactions intended for Sprout
+    if (isOverwinter && !tx.fOverwintered) {
+        return state.DoS(dosLevel, error("ContextualCheckTransaction: overwinter is active"),
+                         REJECT_INVALID, "tx-overwinter-active");
+    }
+
+    // If Overwinter rules apply, reject transactions with overwinter flag set but bad version number
+    if (isOverwinter && tx.fOverwintered && tx.nVersion < CTransaction::OVERWINTER_MIN_CURRENT_VERSION) {
+        return state.DoS(dosLevel, error("ContextualCheckTransaction(): version too low"),
+                         REJECT_INVALID, "tx-overwinter-version-too-low");
+    }
+
+    // If Overwinter rules apply, reject transactions with overwinter flag set but bad version number
+    if (isOverwinter && tx.fOverwintered && tx.nVersion > CTransaction::OVERWINTER_MAX_CURRENT_VERSION) {
+        return state.DoS(dosLevel, error("ContextualCheckTransaction(): version too high"),
+                         REJECT_INVALID, "tx-overwinter-version-too-high");
+    }
+
+    return true;
+}
+
+
 bool CheckTransaction(const CTransaction& tx, CValidationState &state,
                       libzcash::ProofVerifier& verifier)
 {
@@ -866,10 +919,34 @@ bool CheckTransactionWithoutProofVerification(const CTransaction& tx, CValidatio
 {
     // Basic checks that don't depend on any context
 
-    // Check transaction version
-    if (tx.nVersion < MIN_TX_VERSION) {
+    // Pre-Overwinter accepts version >=1 transaction. Overwinter only accepts version 3 transactions.
+    // To enable soft-forks of the transaction format, define a range of versions which can be accepted.
+    if (tx.fOverwintered) {
+        if (tx.nVersion < CTransaction::OVERWINTER_MIN_CURRENT_VERSION) {
+            return state.DoS(100, error("CheckTransaction(): overwinter version too low"),
+                REJECT_INVALID, "bad-tx-overwinter-version-too-low");
+        }
+        else if (tx.nVersion > CTransaction::OVERWINTER_MAX_CURRENT_VERSION ) {
+            return state.DoS(100, error("CheckTransaction(): overwinter version too high"),
+                REJECT_INVALID, "bad-tx-overwinter-version-too-high");
+        }
+    }
+
+    if (!tx.fOverwintered && tx.nVersion < MIN_TX_VERSION) {
         return state.DoS(100, error("CheckTransaction(): version too low"),
                          REJECT_INVALID, "bad-txns-version-too-low");
+    }
+
+    // Check Overwintered tx version group id matches what Zcash has assigned to v3 tx format version.
+    if (tx.fOverwintered && tx.nVersion == 3 && tx.nVersionGroupId != OVERWINTER_VERSION_GROUP_ID) {
+        return state.DoS(100, error("CheckTransaction(): unknown tx version group id"),
+                REJECT_INVALID, "bad-tx-version-group-id");
+    }
+
+    // Check transaction expiry height is within valid range
+    if (tx.fOverwintered && tx.nVersion == 3 && tx.nExpiryHeight > TX_EXPIRY_HEIGHT_THRESHOLD) {
+        return state.DoS(100, error("CheckTransaction(): expiry height is too high"),
+                         REJECT_INVALID, "bad-tx-expiry-height-too-high");
     }
 
     // Transactions can contain empty `vin` and `vout` so long as
@@ -1078,6 +1155,13 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa
     if (!CheckTransaction(tx, state, verifier))
         return error("AcceptToMemoryPool: CheckTransaction failed");
 
+    // FIXME: DoS level set to 10 to be more forgiving... or use 100?
+    // Check transaction contextually against the set of consensus rules which apply in the next block to be mined.
+    int nextBlockHeight = chainActive.Height() + 1;
+    if (!ContextualCheckTransaction(tx, state, nextBlockHeight, 10)) {
+        return error("AcceptToMemoryPool: ContextualCheckTransaction failed");
+    }
+
     // Coinbase is only valid in a block, not as a loose transaction
     if (tx.IsCoinBase())
         return state.DoS(100, error("AcceptToMemoryPool: coinbase as individual tx"),
@@ -1085,7 +1169,7 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa
 
     // Rather not work on nonstandard transactions (unless -testnet/-regtest)
     string reason;
-    if (Params().RequireStandard() && !IsStandardTx(tx, reason))
+    if (Params().RequireStandard() && !IsStandardTx(tx, reason, nextBlockHeight))
         return state.DoS(0,
                          error("AcceptToMemoryPool: nonstandard transaction: %s", reason),
                          REJECT_NONSTANDARD, reason);
@@ -3133,6 +3217,12 @@ bool ContextualCheckBlock(const CBlock& block, CValidationState& state, CBlockIn
 
     // Check that all transactions are finalized
     BOOST_FOREACH(const CTransaction& tx, block.vtx) {
+
+        // Check transaction contextually against consensus rules at block height
+        if (!ContextualCheckTransaction(tx, state, nHeight, 100)) {
+            return false; // Failure reason has been set in validation state object
+        }
+
         int nLockTimeFlags = 0;
         int64_t nLockTimeCutoff = (nLockTimeFlags & LOCKTIME_MEDIAN_TIME_PAST)
                                 ? pindexPrev->GetMedianTimePast()
@@ -3257,6 +3347,7 @@ bool AcceptBlock(CBlock& block, CValidationState& state, CBlockIndex** ppindex, 
 
     // See method docstring for why this is always disabled
     auto verifier = libzcash::ProofVerifier::Disabled();
+
     if ((!CheckBlock(block, state, verifier)) || !ContextualCheckBlock(block, state, pindex->pprev)) {
         if (state.IsInvalid() && !state.CorruptionPossible()) {
             pindex->nStatus |= BLOCK_FAILED_VALID;
@@ -3345,7 +3436,6 @@ bool TestBlockValidity(CValidationState &state, const CBlock& block, CBlockIndex
     indexDummy.nHeight = pindexPrev->nHeight + 1;
     // JoinSplit proofs are verified in ConnectBlock
     auto verifier = libzcash::ProofVerifier::Disabled();
-
     // NOTE: CheckBlockHeader is called by CheckBlock
     if (!ContextualCheckBlockHeader(block, state, pindexPrev))
         return false;
@@ -5735,3 +5825,19 @@ public:
         mapOrphanTransactionsByPrev.clear();
     }
 } instance_of_cmaincleanup;
+
+
+// Set default values of new CMutableTransaction based on consensus rules at given height.
+CMutableTransaction CreateNewContextualCMutableTransaction(const Consensus::Params& consensusParams, int nHeight)
+{
+    CMutableTransaction mtx;
+
+    bool isOverwintered = NetworkUpgradeActive(nHeight, consensusParams, Consensus::UPGRADE_OVERWINTER);
+    if (isOverwintered) {
+        mtx.fOverwintered = true;
+        mtx.nVersionGroupId = OVERWINTER_VERSION_GROUP_ID;
+        mtx.nVersion = 3;
+        // Expiry height is not set. Only fields required for a parser to treat as a valid Overwinter V3 tx.
+    }
+    return mtx;
+}
